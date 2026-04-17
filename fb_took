@@ -1,0 +1,1340 @@
+import time
+import random
+import os
+import json
+import cgi
+import threading
+import unicodedata
+from argparse import ArgumentParser
+from typing import Optional
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, InvalidSessionIdException, WebDriverException
+
+# ==================== CONFIG ====================
+PHONE = "0335423938"
+IMAGE_FOLDER = "images"
+LOG_FILE = "log.txt"
+GROUPS_FILE = "nhom.txt"
+MAX_IMAGES = 4
+
+# Chạy `python main1.py` (không --web): tự like/comment sau mỗi bài (web dùng checkbox trong UI)
+CLI_ENGAGE_LIKE = False
+CLI_ENGAGE_COMMENT = ""
+
+# ⚡ TỐI ƯU THỜI GIAN - Giảm delay
+POST_DELAY_MIN = 2    # 👈 Giảm từ 5s xuống 2s
+POST_DELAY_MAX = 5    # 👈 Giảm từ 10s xuống 5s
+
+BASE_CONTENT = f"""Phòng tại 111 Quan Hoa Cầu Giấy. Ban công thoáng
+
+Đủ đồ chỉ việc vào ở
+
+Ngay đường Oto đi lại và tiện ích xung quanh nhiều
+
+Liên hệ {PHONE} để xem phòng"""
+
+BASE_DIR = Path(__file__).resolve().parent
+HTML_FILE = BASE_DIR / "main.html"
+UPLOAD_DIR = BASE_DIR / "uploads"
+CHROME_PROFILE_DIR = BASE_DIR / "chrome_fb_profile"
+LOGIN_WAIT_CANCEL = threading.Event()
+STATE = {
+    "running": False,
+    "logged_in": False,
+    "login_waiting": False,
+    "stop_requested": False,
+    "logs": [],
+    "driver": None,
+    "worker": None,
+    "uploaded_images": [],
+    "lock": threading.Lock(),
+}
+
+# ==================== LOGGING ====================
+def log(msg: str):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {msg}"
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        # Fallback for Windows terminals with limited codepage support.
+        safe_line = line.encode("cp1258", errors="replace").decode("cp1258", errors="replace")
+        print(safe_line)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    with STATE["lock"]:
+        STATE["logs"].append(line)
+        if len(STATE["logs"]) > 300:
+            STATE["logs"] = STATE["logs"][-300:]
+
+def generate_content() -> str:
+    return BASE_CONTENT
+
+
+def get_driver():
+    with STATE["lock"]:
+        return STATE["driver"]
+
+
+def set_driver(driver):
+    with STATE["lock"]:
+        STATE["driver"] = driver
+
+
+def is_logged_in() -> bool:
+    with STATE["lock"]:
+        return STATE["logged_in"]
+
+
+def set_logged_in(value: bool):
+    with STATE["lock"]:
+        STATE["logged_in"] = value
+
+
+def request_stop():
+    with STATE["lock"]:
+        STATE["stop_requested"] = True
+
+
+def clear_stop():
+    with STATE["lock"]:
+        STATE["stop_requested"] = False
+
+
+def should_stop() -> bool:
+    with STATE["lock"]:
+        return STATE["stop_requested"]
+
+
+def close_driver():
+    LOGIN_WAIT_CANCEL.set()
+    driver = get_driver()
+    if not driver:
+        with STATE["lock"]:
+            STATE["login_waiting"] = False
+        LOGIN_WAIT_CANCEL.clear()
+        set_logged_in(False)
+        return
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    set_driver(None)
+    set_logged_in(False)
+    with STATE["lock"]:
+        STATE["login_waiting"] = False
+    LOGIN_WAIT_CANCEL.clear()
+
+
+def save_groups(groups: list[str]):
+    with open(GROUPS_FILE, "w", encoding="utf-8") as f:
+        for g in groups:
+            f.write(g.strip() + "\n")
+
+
+def set_uploaded_images(paths: list[str]):
+    with STATE["lock"]:
+        STATE["uploaded_images"] = paths
+
+
+def get_uploaded_images() -> list[str]:
+    with STATE["lock"]:
+        return list(STATE["uploaded_images"])
+
+
+def is_facebook_session_ready(driver) -> bool:
+    """True khi đã có phiên đăng nhập hợp lệ (cookie c_user, không còn login/checkpoint)."""
+    try:
+        u = driver.current_url.lower()
+        if "facebook.com" not in u and "fb.com" not in u:
+            return False
+        if "checkpoint" in u or "/recover" in u:
+            return False
+        if "/login" in u or "login.php" in u:
+            return False
+        for c in driver.get_cookies():
+            if c.get("name") == "c_user" and str(c.get("value", "")).strip():
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _wait_for_facebook_login_worker():
+    deadline = time.time() + 1200
+    try:
+        while time.time() < deadline:
+            if LOGIN_WAIT_CANCEL.is_set():
+                log("Đã hủy chờ đăng nhập Facebook")
+                return
+            drv = get_driver()
+            if not drv:
+                log("Trình duyệt đã đóng trước khi đăng nhập xong")
+                return
+            try:
+                if is_facebook_session_ready(drv):
+                    set_logged_in(True)
+                    log("Đã đăng nhập Facebook (tự nhận, không cần bấm thêm)")
+                    return
+            except (InvalidSessionIdException, WebDriverException):
+                log("Phiên trình duyệt mất khi đang chờ đăng nhập")
+                set_logged_in(False)
+                set_driver(None)
+                return
+            except Exception:
+                pass
+            time.sleep(2)
+        if not is_logged_in():
+            log("Hết thời gian chờ đăng nhập (20 phút). Thử bấm lại nút đăng nhập.")
+    finally:
+        with STATE["lock"]:
+            STATE["login_waiting"] = False
+
+
+def login_facebook_once() -> tuple[bool, str]:
+    """
+    Một thao tác: mở Facebook (Chrome dùng profile lưu tại chrome_fb_profile),
+    tự chờ đến khi phát hiện đăng nhập xong.
+    """
+    clear_stop()
+    with STATE["lock"]:
+        if STATE["running"]:
+            return False, "Đang chạy job, không thể đăng nhập lúc này"
+        if STATE["login_waiting"]:
+            drv = STATE["driver"]
+            if drv is None:
+                # Trạng thái lệch (crash / đóng Chrome giữa chừng): cho phép thử lại.
+                STATE["login_waiting"] = False
+                LOGIN_WAIT_CANCEL.clear()
+            else:
+                return False, "Đang chờ bạn đăng nhập trong Chrome — không cần bấm thêm"
+        if STATE["logged_in"]:
+            drv = STATE["driver"]
+            if drv:
+                try:
+                    if is_facebook_session_ready(drv):
+                        return True, "Đã đăng nhập sẵn"
+                except Exception:
+                    pass
+
+    LOGIN_WAIT_CANCEL.clear()
+    try:
+        driver = get_driver()
+        if not driver:
+            driver = init_driver()
+            set_driver(driver)
+        driver.get("https://www.facebook.com/")
+        set_logged_in(False)
+    except Exception as e:
+        log(f"Không thể mở Facebook: {e}")
+        return False, f"Không thể mở Facebook: {e}"
+
+    try:
+        if is_facebook_session_ready(get_driver()):
+            set_logged_in(True)
+            log("Đã đăng nhập sẵn từ profile Chrome (lần trước)")
+            return True, "Đã đăng nhập sẵn (profile Chrome)"
+    except Exception:
+        pass
+
+    log("Đã mở Facebook. Đăng nhập một lần trong cửa sổ Chrome — web sẽ tự nhận khi xong.")
+    with STATE["lock"]:
+        STATE["login_waiting"] = True
+    threading.Thread(target=_wait_for_facebook_login_worker, daemon=True).start()
+    return True, "Đã mở Chrome. Đăng nhập xong là xong, không cần bấm thêm nút nào."
+
+# ==================== LOAD GROUPS ====================
+def load_groups() -> list[str]:
+    """Đọc danh sách group từ file nhom.txt"""
+    if not os.path.exists(GROUPS_FILE):
+        log(f"❌ File '{GROUPS_FILE}' không tồn tại!")
+        return []
+    
+    try:
+        with open(GROUPS_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        groups = [line.strip() for line in lines if line.strip() and line.strip().startswith(("http://", "https://"))]
+        
+        if not groups:
+            log(f"❌ Không có group hợp lệ trong '{GROUPS_FILE}'")
+            return []
+        
+        log(f"✔  Tìm thấy {len(groups)} group:")
+        for idx, group in enumerate(groups, 1):
+            log(f"   {idx}. {group}")
+        
+        return groups
+    
+    except Exception as e:
+        log(f"❌ Lỗi đọc file '{GROUPS_FILE}': {e}")
+        return []
+
+# ==================== IMAGES ====================
+def get_images() -> list[str]:
+    if not os.path.exists(IMAGE_FOLDER):
+        log(f"❌ Thư mục '{IMAGE_FOLDER}' không tồn tại!")
+        return []
+
+    exts = (".jpg", ".jpeg", ".png", ".webp")
+    files = [f for f in os.listdir(IMAGE_FOLDER) if f.lower().endswith(exts)]
+
+    if not files:
+        log(f"❌ Không tìm thấy ảnh trong '{IMAGE_FOLDER}'")
+        return []
+
+    random.shuffle(files)
+    selected = [os.path.abspath(os.path.join(IMAGE_FOLDER, f)) for f in files[:MAX_IMAGES]]
+
+    log(f"✔  Tìm thấy {len(selected)} ảnh")
+    return selected
+
+# ==================== BROWSER ====================
+def init_driver() -> webdriver.Chrome:
+    def _build_options(profile_dir: Optional[Path]) -> webdriver.ChromeOptions:
+        options = webdriver.ChromeOptions()
+        if profile_dir is not None:
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            options.add_argument(f"--user-data-dir={profile_dir}")
+        options.add_argument("--start-maximized")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-plugins")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        return options
+
+    attempts = [
+        ("profile chính", CHROME_PROFILE_DIR),
+        ("profile phụ dự phòng", BASE_DIR / "chrome_fb_profile_fallback"),
+        ("không profile", None),
+    ]
+    last_error = None
+
+    for attempt_name, profile_dir in attempts:
+        try:
+            driver = webdriver.Chrome(options=_build_options(profile_dir))
+            driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
+            )
+            if profile_dir is CHROME_PROFILE_DIR:
+                log("🧩 Mở Chrome bằng profile chính")
+            elif profile_dir is None:
+                log("🧩 Mở Chrome không profile (fallback)")
+            else:
+                log("🧩 Mở Chrome bằng profile phụ (fallback)")
+            return driver
+        except Exception as e:
+            last_error = e
+            log(f"⚠️ Không mở được Chrome với {attempt_name}: {str(e)[:160]}")
+            continue
+
+    raise RuntimeError(f"Không thể khởi tạo ChromeDriver sau nhiều cách thử: {last_error}")
+
+# ==================== FACEBOOK ACTIONS ====================
+def click_create_post(driver, wait: WebDriverWait) -> bool:
+    """Tìm và click nút 'Tạo bài viết' / 'Bạn viết gì đi'."""
+    xpaths = [
+        "//div[@role='button'][.//span[contains(text(), 'Bạn viết gì đi')]]",
+        "//*[contains(text(), 'Bạn viết gì đi')]//ancestor::div[@role='button']",
+        "//div[@role='button'][.//span[contains(text(), 'Write something')]]",
+    ]
+    for xpath in xpaths:
+        try:
+            btn = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+            driver.execute_script("arguments[0].click();", btn)
+            log("✔  Mở dialog tạo bài")
+            time.sleep(1.5)  # 👈 Giảm từ 3s xuống 1.5s
+            return True
+        except Exception:
+            continue
+    log("❌ Không tìm được nút 'Tạo bài viết'")
+    return False
+
+
+def find_post_textbox(driver, wait: WebDriverWait):
+    """Trả về element textbox để gõ nội dung bài viết."""
+    xpaths = [
+        "//div[@role='dialog']//div[@contenteditable='true'][@data-lexical-editor='true']",
+        "//div[@contenteditable='true'][contains(@aria-placeholder, 'Tạo bài viết')]",
+        "//div[@contenteditable='true'][contains(@aria-placeholder, 'viết gì')]",
+    ]
+    for xpath in xpaths:
+        try:
+            box = wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
+            log("✔  Tìm thấy textbox")
+            return box
+        except Exception:
+            continue
+    log("❌ Không tìm được textbox")
+    return None
+
+
+def type_content(post_box, content: str):
+    """Gõ nội dung nhanh hơn - dùng paste thay vì từng ký tự."""
+    post_box.click()
+    time.sleep(0.2)  # 👈 Giảm từ 0.5s xuống 0.2s
+    
+    # 🚀 Dùng Ctrl+A + Ctrl+V để paste nhanh hơn gõ từng ký tự
+    post_box.send_keys(Keys.CONTROL + "a")
+    time.sleep(0.1)
+    post_box.send_keys(content)
+    
+    log("✔  Nhập nội dung xong")
+
+
+def upload_images(driver, wait: WebDriverWait, images: list[str]):
+    """
+    Upload ảnh SONG SONG - gửi tất cả ảnh một lúc thay vì từng cái
+    Nhanh gấp 3-4 lần so với cách gửi từng ảnh
+    """
+    if not images:
+        log("⚠️  Không có ảnh để upload")
+        return
+
+    valid_images = [p for p in images if os.path.exists(p)]
+    if not valid_images:
+        log("❌ Không có file ảnh hợp lệ")
+        return
+
+    log(f"📤 Upload {len(valid_images)} ảnh...")
+
+    try:
+        # 🚀 TÌM INPUT FILE
+        fi = wait.until(EC.presence_of_element_located((
+            By.XPATH,
+            "//div[@role='dialog']//input[@type='file']"
+        )))
+        
+        # 🚀 BỎ CSS XEM BẤT MÀN HÌNH
+        driver.execute_script("""
+            arguments[0].style.display = 'block';
+            arguments[0].style.visibility = 'visible';
+            arguments[0].style.opacity = '1';
+            arguments[0].style.pointerEvents = 'auto';
+            arguments[0].removeAttribute('class');
+        """, fi)
+        
+        time.sleep(0.3)  # 👈 Giảm từ 4s xuống 0.3s
+        
+        # 🚀 GỬI TẤT CẢ ẢNH CỘT LỌC (SONG SONG)
+        file_paths = "\n".join(valid_images)
+        fi.send_keys(file_paths)
+        
+        log(f"✅ Gửi {len(valid_images)} ảnh")
+        
+        # 🚀 CHỜ ẢNH RENDER (giảm từ 6-9s xuống 2-4s)
+        time.sleep(random.uniform(2, 4))
+        
+    except Exception as e:
+        log(f"⚠️  Lỗi upload ảnh: {str(e)[:60]}")
+
+
+def click_post_button(driver, wait: WebDriverWait, after_click_sleep: float = 3.0) -> bool:
+    """
+    Click nút 'Đăng' - không chờ lâu.
+    after_click_sleep: chờ sau khi đăng (khi sẽ like/comment ngay thì dùng ~1s).
+    """
+    # 🚀 GIẢM TIMEOUT từ 15s xuống 8s
+    try:
+        wait_enabled = WebDriverWait(driver, 8)
+        post_btn = wait_enabled.until(
+            EC.element_to_be_clickable((
+                By.XPATH,
+                "//div[@aria-label='Đăng' and not(@aria-disabled='true')]"
+                "| //div[@aria-label='Post' and not(@aria-disabled='true')]"
+            ))
+        )
+        driver.execute_script("arguments[0].click();", post_btn)
+        log("🚀 Đăng bài")
+        time.sleep(after_click_sleep)
+        return True
+    except Exception:
+        pass
+
+    # Fallback
+    try:
+        post_btn = wait.until(EC.element_to_be_clickable((
+            By.XPATH,
+            "//div[@role='dialog']//div[@role='button'][.//span[text()='Đăng']]"
+            "| //div[@role='dialog']//div[@role='button'][.//span[text()='Post']]"
+        )))
+        driver.execute_script("arguments[0].click();", post_btn)
+        log("🚀 Đăng bài (cách 2)")
+        time.sleep(after_click_sleep)
+        return True
+    except Exception as e:
+        log(f"❌ Lỗi click nút đăng: {str(e)[:60]}")
+        return False
+
+
+def save_screenshot(driver, name: str):
+    try:
+        driver.save_screenshot(name)
+        log(f"💾 {name}")
+    except Exception:
+        pass
+
+
+def _engage_snippet(content: str) -> str:
+    s = " ".join(content.strip().split())[:80]
+    return s
+
+
+def _extract_phone(content: str) -> Optional[str]:
+    import re
+    nums = re.findall(r'\d{9,11}', content)
+    return nums[0] if nums else None
+
+
+def _find_post_article(driver, content: str):
+    """Tìm bài của mình = SĐT + bài mới nhất"""
+    phone = _extract_phone(content)
+
+    try:
+        articles = driver.find_elements(By.XPATH, "//div[@role='article']")
+    except Exception:
+        return None
+
+    if not articles or not phone:
+        return None
+
+    # 🎯 chỉ lấy các bài mới nhất
+    recent_articles = articles[:10]
+
+    for art in recent_articles:
+        try:
+            text = (art.text or "").replace("\n", " ").strip()
+            if phone in text:
+                return art  # ✅ đúng bài của bạn
+        except Exception:
+            continue
+
+    return None
+
+
+def _composer_lexical_visible(driver) -> bool:
+    try:
+        for el in driver.find_elements(
+            By.XPATH,
+            "//div[@role='dialog']//div[@contenteditable='true'][@data-lexical-editor='true']",
+        ):
+            if el.is_displayed():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _wait_post_composer_closed(driver, timeout: float = 14.0) -> None:
+    """Sau khi bấm Đăng: chờ khung soạn thảo trong dialog đóng (bài mới hiện trên feed)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline and not should_stop():
+        if not _composer_lexical_visible(driver):
+            return
+        time.sleep(0.18)
+
+
+def _top_feed_article(driver):
+    """
+    Bài đầu feed (không nằm trong dialog). Sau khi đăng, Facebook thường chèn bài mới lên đầu —
+    dùng luôn để like/comment ngay, không chờ quét khớp nội dung.
+    """
+    try:
+        el = driver.execute_script(
+            """
+            const arts = document.querySelectorAll('div[role="article"]');
+            for (const art of arts) {
+                if (art.offsetParent === null) continue;
+                let p = art;
+                let inDlg = false;
+                while (p) {
+                    if (p.getAttribute && p.getAttribute('role') === 'dialog') {
+                        inDlg = true;
+                        break;
+                    }
+                    p = p.parentElement;
+                }
+                if (inDlg) continue;
+                const t = (art.innerText || '').trim();
+                if (t.length < 3) continue;
+                return art;
+            }
+            return null;
+            """
+        )
+        return el
+    except Exception:
+        return None
+
+
+def _click_like_on_article(driver, article) -> bool:
+    def _norm(s: str) -> str:
+        s = (s or "").strip().lower()
+        s = "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
+        return " ".join(s.split())
+
+    include_keys = (
+        "like",
+        "thich",
+        "yeu thich",
+        "love",
+        "reaction",
+        "cam xuc",
+    )
+    exclude_keys = (
+        "comment",
+        "binh luan",
+        "share",
+        "chia se",
+        "gui",
+        "send",
+    )
+    already_liked_keys = ("da thich", "liked", "you liked this")
+
+    candidates = []
+    try:
+        candidates = article.find_elements(By.XPATH, ".//*[@role='button' or self::button]")
+    except Exception:
+        pass
+
+    for b in candidates:
+        try:
+            if not b.is_displayed():
+                continue
+            label = _norm(b.get_attribute("aria-label") or "")
+            text = _norm(b.text or "")
+            testid = _norm(b.get_attribute("data-testid") or "")
+            title = _norm(b.get_attribute("title") or "")
+            merged = " ".join(x for x in (label, text, testid, title) if x)
+            if not merged:
+                continue
+            if any(k in merged for k in exclude_keys):
+                continue
+            if any(k in merged for k in already_liked_keys):
+                return True
+            if not any(k in merged for k in include_keys):
+                continue
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
+            time.sleep(0.1)
+            driver.execute_script("arguments[0].click();", b)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _submit_comment_on_article(driver, wait: WebDriverWait, article, comment_text: str) -> bool:
+    def _norm(s: str) -> str:
+        s = (s or "").strip().lower()
+        s = "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
+        return " ".join(s.split())
+
+    trigger_include_keys = (
+        "comment",
+        "binh luan",
+        "viet binh luan",
+        "write a comment",
+        "public comment",
+    )
+    trigger_exclude_keys = ("share", "chia se", "like", "thich", "reaction", "cam xuc")
+
+    comment_triggers = [
+        ".//*[@role='button' or self::button]",
+    ]
+    opened = False
+    for xp in comment_triggers:
+        try:
+            els = article.find_elements(By.XPATH, xp)
+            for el in els:
+                try:
+                    if not el.is_displayed():
+                        continue
+                    label = _norm(el.get_attribute("aria-label") or "")
+                    text = _norm(el.text or "")
+                    title = _norm(el.get_attribute("title") or "")
+                    merged = " ".join(x for x in (label, text, title) if x)
+                    if not merged:
+                        continue
+                    if any(k in merged for k in trigger_exclude_keys):
+                        continue
+                    if not any(k in merged for k in trigger_include_keys):
+                        continue
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                    time.sleep(0.1)
+                    driver.execute_script("arguments[0].click();", el)
+                    opened = True
+                    break
+                except Exception:
+                    continue
+            if opened:
+                break
+        except Exception:
+            continue
+
+    if not opened:
+        try:
+            inline = article.find_elements(
+                By.XPATH,
+                ".//div[@contenteditable='true'][contains(@aria-placeholder,'bình luận') "
+                "or contains(@aria-placeholder,'comment') or contains(@aria-placeholder,'viết')]",
+            )
+            if inline:
+                opened = True
+        except Exception:
+            pass
+
+    time.sleep(0.35)
+    short = WebDriverWait(driver, 10)
+    box = None
+    try:
+        boxes = article.find_elements(By.XPATH, ".//div[@contenteditable='true']")
+        for b in boxes:
+            if b.is_displayed():
+                box = b
+                break
+    except Exception:
+        pass
+    if box is None:
+        box_xpaths = [
+            "//div[@role='dialog']//div[@contenteditable='true']",
+            "//form//div[@contenteditable='true']",
+            "//div[@contenteditable='true'][@data-lexical-editor='true']",
+            "//div[@contenteditable='true'][contains(@aria-placeholder,'bình luận')]",
+            "//div[@contenteditable='true'][contains(@aria-placeholder,'Comment')]",
+            "//div[@contenteditable='true'][contains(@aria-placeholder,'Viết bình luận')]",
+            "//div[@contenteditable='true'][contains(@aria-label,'comment')]",
+            "//div[@role='textbox' and @contenteditable='true']",
+        ]
+        for xp in box_xpaths:
+            try:
+                el = short.until(EC.presence_of_element_located((By.XPATH, xp)))
+                if el and el.is_displayed():
+                    box = el
+                    break
+            except Exception:
+                continue
+    if box is None:
+        return False
+
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", box)
+        time.sleep(0.1)
+        box.click()
+        time.sleep(0.1)
+        box.send_keys(comment_text)
+        time.sleep(0.2)
+        box.send_keys(Keys.ENTER)
+        time.sleep(0.25)
+    except Exception:
+        try:
+            box.send_keys(Keys.CONTROL + Keys.ENTER)
+            time.sleep(0.25)
+        except Exception:
+            return False
+
+    try:
+        submit_btns = driver.find_elements(
+            By.XPATH,
+            "//div[@role='button'][@aria-label='Comment' or @aria-label='Bình luận' or @aria-label='Post']"
+            "| //div[@role='button'][.//span[text()='Bình luận'] or .//span[text()='Comment']]",
+        )
+        for sb in submit_btns[-3:]:
+            try:
+                if sb.is_displayed():
+                    driver.execute_script("arguments[0].click();", sb)
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    time.sleep(0.45)
+    return True
+
+
+def engage_with_fresh_post(
+    driver,
+    wait: WebDriverWait,
+    group_url: str,
+    post_content: str,
+    do_like: bool,
+    comment_text: Optional[str],
+) -> None:
+    """Ngay sau khi đăng: chờ khung viết bài đóng → lấy bài đầu feed → like/comment (không chờ 'bắt' theo nội dung)."""
+    if not do_like and not (comment_text and comment_text.strip()):
+        return
+
+    log("💬 Like/comment ngay sau khi đăng (bài đầu feed sau khi đóng composer)…")
+    if should_stop():
+        return
+
+    _wait_post_composer_closed(driver, timeout=14.0)
+    time.sleep(random.uniform(0.18, 0.4))
+    if should_stop():
+        return
+
+    article = None
+    for _ in range(4):
+        if should_stop():
+            return
+        try:
+            driver.execute_script("window.scrollTo(0, 0);")
+        except Exception:
+            pass
+        time.sleep(0.12)
+        article = None
+
+time.sleep(0.6)  # 👈 chờ Facebook render bài
+
+for _ in range(8):
+    if should_stop():
+        return
+
+    try:
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(0.15)
+    except Exception:
+        pass
+
+    article = _find_post_article(driver, post_content)
+
+    if article:
+        log("🎯 Đã bắt đúng bài của mình (theo SĐT + mới nhất)")
+        break
+
+    time.sleep(0.4)
+
+if article is None:
+    log("⚠️ Không tìm thấy bài của mình → bỏ qua để tránh like nhầm")
+    return
+        if article is not None:
+            break
+        time.sleep(0.35)
+
+    if article is None:
+        log("⚠️  Chưa thấy bài trên trang — tải lại group một lần…")
+        try:
+            driver.get(group_url)
+            time.sleep(random.uniform(0.9, 1.4))
+        except Exception:
+            pass
+        if should_stop():
+            return
+        try:
+            driver.execute_script("window.scrollTo(0, 220);")
+            time.sleep(0.25)
+        except Exception:
+            pass
+        article = _top_feed_article(driver)
+        if article is None:
+            article = _find_post_article(driver, post_content)
+
+    if article is None:
+        log("⚠️  Không tìm thấy bài trên feed để like/comment")
+        return
+
+    if do_like:
+        if should_stop():
+            return
+        try:
+            if _click_like_on_article(driver, article):
+                log("✔  Đã like bài vừa đăng")
+            else:
+                log("⚠️  Không bấm được nút like (có thể đã like hoặc giao diện khác)")
+        except Exception as e:
+            log(f"⚠️  Lỗi like: {str(e)[:80]}")
+        time.sleep(random.uniform(0.2, 0.45))
+
+    if comment_text and comment_text.strip():
+        if should_stop():
+            return
+        try:
+            if _submit_comment_on_article(driver, wait, article, comment_text.strip()):
+                log("✔  Đã gửi bình luận trên bài vừa đăng")
+            else:
+                log("⚠️  Không gửi được bình luận (thử chỉnh nội dung hoặc giao diện FB)")
+        except Exception as e:
+            log(f"⚠️  Lỗi comment: {str(e)[:80]}")
+
+
+# ==================== MAIN ====================
+def post_to_group(
+    driver,
+    wait: WebDriverWait,
+    group_url: str,
+    content: str,
+    images: list[str],
+    *,
+    engage_like: bool = False,
+    engage_comment: Optional[str] = None,
+) -> bool:
+    """🚀 QUY TRÌNH POST NHANH - tối ưu từng bước"""
+    
+    # 1️⃣ VÀO GROUP
+    driver.get(group_url)
+    time.sleep(random.uniform(2, 3))  # 👈 Giảm từ 6-10s xuống 2-3s
+    
+    if "login" in driver.current_url:
+        log("❌ Hết phiên đăng nhập!")
+        return False
+    
+    # 2️⃣ SCROLL NHẸ
+    driver.execute_script("window.scrollTo(0, 200)")
+    time.sleep(0.5)  # 👈 Giảm từ 2s xuống 0.5s
+    
+    # 3️⃣ CLICK TẠO BÀI
+    if not click_create_post(driver, wait):
+        save_screenshot(driver, "err_create.png")
+        return False
+    
+    # 4️⃣ TÌM TEXTBOX
+    post_box = find_post_textbox(driver, wait)
+    if post_box is None:
+        save_screenshot(driver, "err_textbox.png")
+        return False
+    
+    # 5️⃣ VIẾT NỘI DUNG + UPLOAD ẢNH SONG SONG
+    try:
+        type_content(post_box, content)
+        upload_images(driver, wait, images)
+    except Exception as e:
+        log(f"❌ Lỗi: {e}")
+        return False
+    
+    # 6️⃣ ĐĂNG BÀI (nếu sẽ like/comment: chờ ngắn hơn rồi tương tác ngay trên feed)
+    will_engage = bool(engage_like or (engage_comment and engage_comment.strip()))
+    after_sleep = 1.05 if will_engage else 3.0
+    if not click_post_button(driver, wait, after_click_sleep=after_sleep):
+        time.sleep(0.6)  # 👈 cho bài xuất hiện trên feed
+        save_screenshot(driver, "err_post.png")
+        return False
+    
+    log("✅ THÀNH CÔNG")
+    if will_engage:
+        engage_with_fresh_post(driver, wait, group_url, content, engage_like, engage_comment)
+    return True
+
+
+def main():
+    groups = load_groups()
+    if not groups:
+        log("❌ Không có group, thoát")
+        return
+    
+    images = get_images()
+
+    try:
+        driver = init_driver()
+    except Exception as e:
+        log(f"❌ Lỗi ChromeDriver: {e}")
+        return
+
+    wait = WebDriverWait(driver, 15)
+
+    driver.get("https://www.facebook.com")
+    input("👉 Đăng nhập xong, Enter để tiếp tục...")
+
+    try:
+        for idx, group_url in enumerate(groups):
+            log(f"\n{'='*50}")
+            log(f"📌 Group {idx + 1}/{len(groups)}")
+            log(f"{'='*50}")
+
+            content = generate_content()
+            ec = CLI_ENGAGE_COMMENT.strip() or None
+            success = post_to_group(
+                driver,
+                wait,
+                group_url,
+                content,
+                images,
+                engage_like=CLI_ENGAGE_LIKE,
+                engage_comment=ec,
+            )
+
+            if not success:
+                log(f"⚠️  Bỏ qua group {idx + 1}")
+
+            # NGHỈ GIỮA CÁC GROUP (rút gọn)
+            if idx < len(groups) - 1:
+                delay = random.randint(POST_DELAY_MIN, POST_DELAY_MAX)
+                log(f"⏳ Chờ {delay}s...")
+                time.sleep(delay)
+
+    except KeyboardInterrupt:
+        log("\n⏸️  Dừng")
+    except Exception as e:
+        log(f"❌ Lỗi: {e}")
+    finally:
+        try:
+            driver.quit()
+            log("✔  Đóng trình duyệt")
+        except Exception:
+            pass
+        log("\n🎉 Hoàn thành")
+
+
+def _recover_driver_for_web_job() -> tuple[Optional[webdriver.Chrome], Optional[WebDriverWait]]:
+    """
+    Tạo lại driver khi phiên cũ bị rớt. Ưu tiên dùng profile đã lưu để tự nhận đăng nhập lại.
+    """
+    try:
+        old = get_driver()
+        if old:
+            try:
+                old.quit()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    set_driver(None)
+    set_logged_in(False)
+    LOGIN_WAIT_CANCEL.clear()
+
+    try:
+        new_driver = init_driver()
+        set_driver(new_driver)
+        new_wait = WebDriverWait(new_driver, 15)
+        new_driver.get("https://www.facebook.com/")
+        time.sleep(1.0)
+        if is_facebook_session_ready(new_driver):
+            set_logged_in(True)
+            log("✅ Đã khôi phục phiên Chrome và nhận đăng nhập từ profile")
+            return new_driver, new_wait
+        log("❌ Khôi phục driver xong nhưng chưa có phiên Facebook đăng nhập")
+        return None, None
+    except Exception as e:
+        log(f"❌ Không thể khôi phục driver: {e}")
+        return None, None
+
+
+def run_post_job(
+    groups: list[str],
+    content: str,
+    delay_from: int,
+    delay_to: int,
+    use_uploaded_images: bool,
+    engage_like: bool = False,
+    engage_comment: Optional[str] = None,
+):
+    """Run posting flow in background for web mode."""
+    with STATE["lock"]:
+        STATE["running"] = True
+
+    try:
+        if not groups:
+            log("❌ Danh sách group trống, dừng job")
+            return
+
+        driver = get_driver()
+        if not driver:
+            log("❌ Chưa có phiên đăng nhập. Hãy đăng nhập trước.")
+            return
+
+        wait = WebDriverWait(driver, 15)
+        if not is_logged_in():
+            log("❌ Bạn chưa đăng nhập Facebook.")
+            return
+
+        images = get_uploaded_images() if use_uploaded_images else get_images()
+        if use_uploaded_images:
+            log(f"🖼️ Dùng {len(images)} ảnh đã upload từ web")
+        if engage_like or (engage_comment and engage_comment.strip()):
+            log("ℹ️ Đã bật: sau mỗi bài sẽ tự like và/hoặc bình luận (nếu Facebook hiển thị đúng)")
+
+        for idx, group_url in enumerate(groups):
+            if should_stop():
+                log("⏹️ Đã nhận yêu cầu dừng job.")
+                break
+
+            log(f"\n{'=' * 50}")
+            log(f"📌 Group {idx + 1}/{len(groups)}")
+            log(f"{'=' * 50}")
+
+            success = False
+            retried_after_recover = False
+            while True:
+                try:
+                    success = post_to_group(
+                        driver,
+                        wait,
+                        group_url,
+                        content,
+                        images,
+                        engage_like=engage_like,
+                        engage_comment=engage_comment,
+                    )
+                    break
+                except (InvalidSessionIdException, WebDriverException) as e:
+                    if retried_after_recover:
+                        log(f"❌ Mất phiên lần 2 ở group {idx + 1}: {e}")
+                        raise
+                    log(f"⚠️ Mất phiên trình duyệt ở group {idx + 1}, đang tự khôi phục: {e}")
+                    new_driver, new_wait = _recover_driver_for_web_job()
+                    if not new_driver or not new_wait:
+                        log("❌ Không khôi phục được phiên trình duyệt, dừng job.")
+                        raise
+                    driver, wait = new_driver, new_wait
+                    retried_after_recover = True
+                    log(f"🔁 Thử lại group {idx + 1} sau khi khôi phục phiên...")
+
+            if not success:
+                log(f"⚠️  Bỏ qua group {idx + 1}")
+
+            if idx < len(groups) - 1:
+                delay = random.randint(delay_from, delay_to)
+                log(f"⏳ Chờ {delay}s...")
+                for _ in range(delay):
+                    if should_stop():
+                        log("⏹️ Dừng trong lúc delay.")
+                        break
+                    time.sleep(1)
+                if should_stop():
+                    break
+    except (InvalidSessionIdException, WebDriverException) as e:
+        log(f"❌ Phiên trình duyệt đã mất: {e}")
+        set_logged_in(False)
+        set_driver(None)
+    except Exception as e:
+        log(f"❌ Lỗi job nền: {e}")
+    finally:
+        with STATE["lock"]:
+            STATE["running"] = False
+            STATE["worker"] = None
+            STATE["stop_requested"] = False
+        log("🎉 Hoàn thành job từ frontend")
+
+
+class AppHandler(BaseHTTPRequestHandler):
+    @staticmethod
+    def _norm_path(raw: str) -> str:
+        """Path gốc có thể kèm ?query — nếu không chuẩn hóa thì POST /api/login-once?s=1 sẽ 404."""
+        p = raw.split("?", 1)[0].split("#", 1)[0]
+        return p
+
+    def _send_json(self, data: dict, status: int = 200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, html: str, status: int = 200):
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self._norm_path(self.path)
+        if path in ("/", "/index.html"):
+            if not HTML_FILE.exists():
+                self._send_html("<h1>main.html not found</h1>", 404)
+                return
+            self._send_html(HTML_FILE.read_text(encoding="utf-8"))
+            return
+
+        if path == "/api/status":
+            with STATE["lock"]:
+                data = {
+                    "running": STATE["running"],
+                    "logged_in": STATE["logged_in"],
+                    "login_waiting": STATE["login_waiting"],
+                    "stop_requested": STATE["stop_requested"],
+                    "uploaded_count": len(STATE["uploaded_images"]),
+                    "logs": STATE["logs"][-80:],
+                }
+            self._send_json(data)
+            return
+        if path == "/api/groups":
+            self._send_json({"groups": load_groups()})
+            return
+
+        self._send_json({"error": "Not found"}, 404)
+
+    def do_POST(self):
+        path = self._norm_path(self.path)
+        if path not in (
+            "/api/start",
+            "/api/login-once",
+            "/api/stop",
+            "/api/logout",
+            "/api/groups",
+            "/api/upload",
+        ):
+            self._send_json({"error": "Not found"}, 404)
+            return
+
+        if path == "/api/upload":
+            ctype = self.headers.get("Content-Type", "")
+            if not ctype.startswith("multipart/form-data"):
+                self._send_json({"error": "Yêu cầu phải là multipart/form-data"}, 400)
+                return
+
+            form = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": ctype},
+            )
+            files = form["files"] if "files" in form else []
+            if not isinstance(files, list):
+                files = [files]
+
+            UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            allowed_exts = {".jpg", ".jpeg", ".png", ".webp"}
+            saved_paths: list[str] = []
+
+            for f in files:
+                if not getattr(f, "filename", None):
+                    continue
+                ext = Path(f.filename).suffix.lower()
+                if ext not in allowed_exts:
+                    continue
+                safe_name = f"{int(time.time() * 1000)}_{os.path.basename(f.filename)}"
+                dest = UPLOAD_DIR / safe_name
+                data = f.file.read()
+                with open(dest, "wb") as out:
+                    out.write(data)
+                saved_paths.append(str(dest.resolve()))
+
+            if not saved_paths:
+                self._send_json({"error": "Không có ảnh hợp lệ để upload"}, 400)
+                return
+
+            set_uploaded_images(saved_paths)
+            log(f"✅ Đã upload {len(saved_paths)} ảnh từ giao diện web")
+            self._send_json({"ok": True, "count": len(saved_paths), "paths": saved_paths})
+            return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self._send_json({"error": "JSON không hợp lệ"}, 400)
+            return
+  
+        if path == "/api/login-once":
+            try:
+                ok, message = login_facebook_once()
+            except Exception as e:
+                log(f"Lỗi /api/login-once: {e}")
+                self._send_json({"ok": False, "error": str(e)}, 500)
+                return
+            self._send_json({"ok": ok, "message": message}, 200 if ok else 400)
+            return
+
+        if path == "/api/logout":
+            with STATE["lock"]:
+                if STATE["running"]:
+                    self._send_json({"error": "Đang chạy job, không thể logout."}, 409)
+                    return
+            close_driver()
+            log("ℹ️ Đã logout phiên Facebook")
+            self._send_json({"ok": True, "message": "Đã logout"})
+            return
+
+        if path == "/api/stop":
+            with STATE["lock"]:
+                if not STATE["running"]:
+                    STATE["stop_requested"] = False
+                    self._send_json({"ok": True, "message": "Hiện không có job nào đang chạy"})
+                    return
+            request_stop()
+            self._send_json({"ok": True, "message": "Đã gửi yêu cầu dừng"})
+            return
+
+        if path == "/api/groups":
+            groups = payload.get("groups", [])
+            if not isinstance(groups, list):
+                self._send_json({"error": "groups phải là mảng"}, 400)
+                return
+            clean_groups = [g.strip() for g in groups if isinstance(g, str) and g.strip()]
+            save_groups(clean_groups)
+            self._send_json({"ok": True, "count": len(clean_groups)})
+            return
+
+        with STATE["lock"]:
+            if STATE["running"]:
+                self._send_json({"error": "Đang có job chạy, vui lòng chờ."}, 409)
+                return
+
+        groups = payload.get("groups") or load_groups()
+        if not isinstance(groups, list):
+            self._send_json({"error": "groups phải là mảng URL"}, 400)
+            return
+        groups = [g.strip() for g in groups if isinstance(g, str) and g.strip()]
+        if not groups:
+            self._send_json({"error": "Vui lòng nhập ít nhất 1 group URL"}, 400)
+            return
+        if not is_logged_in():
+            self._send_json({"error": "Bạn chưa đăng nhập Facebook trên web."}, 401)
+            return
+
+        content = (payload.get("content") or BASE_CONTENT).strip() or BASE_CONTENT
+        delay_from = int(payload.get("delay_from", POST_DELAY_MIN))
+        delay_to = int(payload.get("delay_to", POST_DELAY_MAX))
+        use_uploaded_images = bool(payload.get("use_uploaded_images", False))
+        engage_like = bool(payload.get("engage_like", False))
+        engage_comment_raw = payload.get("engage_comment")
+        engage_comment: Optional[str] = None
+        if engage_comment_raw is not None and str(engage_comment_raw).strip():
+            engage_comment = str(engage_comment_raw).strip()
+        if delay_from < 1:
+            delay_from = 1
+        if delay_to < delay_from:
+            delay_to = delay_from
+
+        clear_stop()
+        worker = threading.Thread(
+            target=run_post_job,
+            args=(groups, content, delay_from, delay_to, use_uploaded_images, engage_like, engage_comment),
+            daemon=True,
+        )
+        with STATE["lock"]:
+            STATE["worker"] = worker
+        worker.start()
+        self._send_json({"ok": True, "message": "Đã bắt đầu job"})
+
+    def log_message(self, format, *args):
+        return
+
+
+def run_web_server(host: str = "127.0.0.1", port: int = 8000):
+    server = ThreadingHTTPServer((host, port), AppHandler)
+    log(f"🌐 Web UI: http://{host}:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log("⏹️ Dừng web server")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    parser.add_argument("--web", action="store_true", help="Chạy web server cho main.html")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+
+    if args.web:
+        run_web_server(args.host, args.port)
+    else:
+        main()
